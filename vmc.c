@@ -1,56 +1,40 @@
 /* Virtual memory card RPC server (vmc_rpc.h).
  *
- * The EE loads the SDK's vmcman.irx (mcman's filesystem over an iomanX file
- * instead of SIO2), then this module. MOUNT binds vmc0: to an image; the file
- * calls are plain iomanX operations on vmc0: paths, run on this module's RPC
- * thread. Writes land in the image file page by page (512 data + 16 ECC),
- * so the same file opens in PCSX2 and in the SDK's vmc tools.
- *
- * A fresh image from tools/vmc/mkcard.py carries a valid superblock with an
- * empty indirect-FAT list (ifc_list[0] = 0xffffffff); a formatted card always
- * has one. MOUNT formats only such an image, so a real save card is never
- * formatted by accident.
+ * The EE loads vmcman.irx (mcman's filesystem over an iomanX file instead of
+ * SIO2), then this module. MOUNT binds a slot's device (vmc0:, vmc1:) to a
+ * card image, formatted beforehand by tools/vmc/ps2mc.py or by FORMAT here
+ * (vmcman mounts only formatted cards); the file calls are plain iomanX operations on those
+ * paths, run on this module's RPC thread. Writes land in the image page by
+ * page (512 data + 16 ECC), so the same file opens in PCSX2. REMOUNT reopens
+ * a slot's image after the host session that owned its file handle went
+ * away (a ps2client reattach).
  */
 #include "irx_imports.h"
 #include "vmc_rpc.h"
+#include "vmc_format.h"
 
 #define PS2_VMC_THREAD_PRIORITY 0x60
 #define PS2_VMC_THREAD_STACK    0x1000
-#define PS2_VMC_IFC_LIST_OFFSET 0x50
-
 static SifRpcDataQueue_t g_queue;
 static SifRpcServerData_t g_server;
 static Ps2VmcRequest g_request __attribute__((aligned(64)));
 static Ps2VmcReply g_reply __attribute__((aligned(64)));
+static char g_image[PS2_VMC_SLOTS][PS2_VMC_PATH_MAX];   /* mounted images, for REMOUNT */
 
-static int vmc_image_is_fresh(const char *path)
+/* "vmc0:" / "vmc1:" */
+static const char *vmc_device(int slot)
 {
-    unsigned char sb[PS2_VMC_IFC_LIST_OFFSET + 4];
-    const int fd = iomanX_open(path, FIO_O_RDONLY, 0);
-    int n;
-
-    if (fd < 0)
-        return fd;
-    n = iomanX_read(fd, sb, sizeof(sb));
-    iomanX_close(fd);
-    if (n != (int)sizeof(sb))
-        return -EIO;
-    return sb[PS2_VMC_IFC_LIST_OFFSET] == 0xff && sb[PS2_VMC_IFC_LIST_OFFSET + 1] == 0xff &&
-           sb[PS2_VMC_IFC_LIST_OFFSET + 2] == 0xff && sb[PS2_VMC_IFC_LIST_OFFSET + 3] == 0xff;
+    static char dev[] = "vmc0:";
+    dev[3] = (char)('0' + slot);
+    return dev;
 }
 
-static int vmc_mount(const char *path)
+static int vmc_mount(int slot, const char *path)
 {
-    const int fresh = vmc_image_is_fresh(path);
-    int r;
-
-    if (fresh < 0)
-        return fresh;
-    r = iomanX_mount("vmc0:", path, 0, NULL, 0);
-    if (r < 0 || !fresh)
-        return r;
-    r = iomanX_format("vmc0:", NULL, NULL, 0);
-    return r < 0 ? r : 1;
+    const int r = iomanX_mount(vmc_device(slot), path, 0, NULL, 0);
+    if (r >= 0 && path != g_image[slot])
+        strcpy(g_image[slot], path);
+    return r;
 }
 
 static void *rpc_handler(int fn, void *buffer, int size)
@@ -61,9 +45,14 @@ static void *rpc_handler(int fn, void *buffer, int size)
     (void)size;
     req->path[PS2_VMC_PATH_MAX - 1] = '\0';
     len = (unsigned int)req->len <= PS2_VMC_CHUNK ? (unsigned int)req->len : PS2_VMC_CHUNK;
+    if ((fn == PS2_VMC_MOUNT || fn == PS2_VMC_REMOUNT) &&
+        (req->arg < 0 || req->arg >= PS2_VMC_SLOTS)) {
+        g_reply.result = -EINVAL;
+        return &g_reply;
+    }
     switch (fn) {
     case PS2_VMC_MOUNT:
-        g_reply.result = vmc_mount(req->path);
+        g_reply.result = vmc_mount(req->arg, req->path);
         break;
     case PS2_VMC_OPEN:
         g_reply.result = iomanX_open(req->path, req->arg, 0666);
@@ -76,6 +65,15 @@ static void *rpc_handler(int fn, void *buffer, int size)
         break;
     case PS2_VMC_CLOSE:
         g_reply.result = iomanX_close(req->arg);
+        break;
+    case PS2_VMC_REMOUNT:
+        /* A host: handle belongs to the ps2client session that opened it;
+           after a reattach the old one fails every page. */
+        iomanX_umount(vmc_device(req->arg));
+        g_reply.result = g_image[req->arg][0] ? vmc_mount(req->arg, g_image[req->arg]) : -ENXIO;
+        break;
+    case PS2_VMC_FORMAT:
+        g_reply.result = vmc_format_image(req->path);
         break;
     case PS2_VMC_MKDIR:
         g_reply.result = iomanX_mkdir(req->path, 0777);

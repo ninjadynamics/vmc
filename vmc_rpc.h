@@ -8,6 +8,7 @@
 #define PS2_VMC_RPC_SID    0x564d4331u  /* VMC1 */
 #define PS2_VMC_CHUNK      4096u        /* data bytes per call */
 #define PS2_VMC_PATH_MAX   128u
+#define PS2_VMC_SLOTS      2            /* vmc0:, vmc1: */
 
 /* iomanX open flags (the IOP fio values, also used by libmc's mcOpen). */
 #define PS2_VMC_O_RDONLY   0x0001
@@ -16,12 +17,16 @@
 #define PS2_VMC_O_TRUNC    0x0400
 
 enum {
-    PS2_VMC_MOUNT = 1,  /* path: image; result 0 mounted, 1 formatted a fresh image, <0 error */
+    PS2_VMC_MOUNT = 1,  /* arg: slot, path: formatted image; result 0 mounted, <0 error */
     PS2_VMC_OPEN  = 2,  /* path, arg: flags; result fd */
     PS2_VMC_READ  = 3,  /* arg: fd, len; result bytes, data in the reply */
     PS2_VMC_WRITE = 4,  /* arg: fd, len, data; result bytes */
     PS2_VMC_CLOSE = 5,  /* arg: fd */
-    PS2_VMC_MKDIR = 6   /* path */
+    PS2_VMC_MKDIR = 6,  /* path */
+    PS2_VMC_REMOUNT = 7,/* arg: slot; remount its image, whose host file handle died
+                           with a ps2client session; result as MOUNT */
+    PS2_VMC_FORMAT = 8  /* path: image to create as a new formatted 8 MB card;
+                           the caller checks it is absent; result 0 or <0 */
 };
 
 typedef struct {
